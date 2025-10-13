@@ -5,6 +5,8 @@ import torch
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from pathlib import Path
+from datetime import datetime
 
 from model.transformer_model import (
     SimpleTransformer,
@@ -31,11 +33,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ──────────────────────── Модель та сховище ───────────────────────
-MODEL_PATH = "backend/saved_model.pth"
+# ──────────────────────── Шляхи (pathlib) ────────────────────────
+# .../ai-architecture-app/backend
+BASE_DIR: Path = Path(__file__).resolve().parent
+DATA_DIR: Path = BASE_DIR / "data"                   # .../backend/data
+DATASETS_DIR: Path = DATA_DIR / "datasets"           # .../backend/data/datasets
+MODEL_PATH: Path = BASE_DIR / "saved_model.pth"      # .../backend/saved_model.pth
+DATASETS_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Ліниве створення моделі (CPU)
-_model: Optional[SimpleTransformer] = None
+# ──────────────────────── Модель та сховище ───────────────────────
+_model: Optional[SimpleTransformer] = None  # ліниве створення (CPU)
 
 
 def get_model(input_len: int, target_len: int) -> SimpleTransformer:
@@ -48,13 +56,12 @@ def get_model(input_len: int, target_len: int) -> SimpleTransformer:
     if _model is not None:
         return _model
 
-    # Спроба завантажити існуючу
     loaded = load_model(MODEL_PATH)
     if loaded is not None:
         _model = loaded
         return _model
 
-    # Ініціалізувати нову (типові довжини : X≈441, Y≈441)
+    # Ініціалізувати нову (типові довжини: X≈441, Y≈441)
     _model = SimpleTransformer(input_seq_len=input_len, target_seq_len=target_len)
     return _model
 
@@ -91,8 +98,11 @@ def predict_endpoint(body: PredictJSON):
     model.eval()
 
     with torch.no_grad():
-        tokens = predict_tokens_greedy(model, x, max_len=model.target_seq_len, start_token=START_TOKEN)  # (Lt,)
-        # Безпечно підрізати/доповнити до 441 токенів
+        tokens = predict_tokens_greedy(
+            model, x, max_len=model.target_seq_len, start_token=START_TOKEN
+        )  # (Lt,)
+
+        # Підрізати/доповнити до 441 токенів
         lt = tokens.shape[0]
         if lt < 441:
             pad = torch.zeros(441 - lt, dtype=torch.long)
@@ -109,7 +119,7 @@ def train_endpoint(body: TrainJSON):
     """
     Донавчання:
       - якщо Y_data подано: тренуємо на (X, Y)
-      - якщо Y_data немає: використовуємо auto-regressive teacher forcing, де ціль — зміщені токени.
+      - якщо Y_data немає: псевдоціль (нули) — лише для адаптації ембеддингів, краще надавати реальний Y
     """
     x = torch.tensor(body.X_data, dtype=torch.float32).unsqueeze(0)  # (1, Lx)
     model = get_model(input_len=x.shape[1], target_len=441)
@@ -124,7 +134,6 @@ def train_endpoint(body: TrainJSON):
             y = y[:441]
         y = y.view(1, -1)  # (1, Ly)
     else:
-        # псевдо-ціль: нулі (крім старту) — дозволить стабільно пройти backward,
         y = torch.zeros((1, 441), dtype=torch.long)
 
     loss_hist = []
@@ -133,7 +142,12 @@ def train_endpoint(body: TrainJSON):
         loss_hist.append(loss)
 
     save_model(model, MODEL_PATH)
-    return {"status": "trained", "epochs": body.epochs, "last_loss": loss_hist[-1], "avg_loss": sum(loss_hist) / len(loss_hist)}
+    return {
+        "status": "trained",
+        "epochs": body.epochs,
+        "last_loss": loss_hist[-1],
+        "avg_loss": sum(loss_hist) / len(loss_hist),
+    }
 
 
 @app.post("/api/train/upload")
@@ -143,21 +157,26 @@ async def train_from_file(
     epochs: int = Form(150),
     lr: float = Form(0.001),
 ):
-    import io, os, time, pandas as pd
-    from datetime import datetime
+    """
+    Завантаження CSV/Excel:
+      ВАРІАНТ A (тільки X): файл містить X-ознаки → self-supervised (псевдоціль)
+      ВАРІАНТ B (X+Y): файл містить X і Y → повноцінне навчання на (X, Y)
+    Підтримка: .csv, .xlsx. Для Excel можна вказати назву аркуша через sheet; якщо не вказано — автодетект.
+    """
+    import pandas as pd  # локальний імпорт, щоб уникати важкого імпорту зайвий раз
 
     content = await file.read()
     buf = io.BytesIO(content)
 
     # --- LOG: зберегти оригінал файлу
-    os.makedirs("backend/data/datasets", exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_name = os.path.splitext(file.filename or f"dataset_{ts}")[0]
-    orig_path = f"backend/data/datasets/{ts}__{base_name}{os.path.splitext(file.filename or '')[1] or '.bin'}"
+    base_name = Path(file.filename or f"dataset_{ts}").stem
+    ext = Path(file.filename or "").suffix or ".bin"
+    orig_path = DATASETS_DIR / f"{ts}__{base_name}{ext}"
     with open(orig_path, "wb") as f:
         f.write(content)
 
-    # --- парсинг X+Y або тільки X (з авто-детектом аркуша)
+    # --- парсинг X+Y або тільки X (utils має автодетект аркуша X для .xlsx)
     X_list, Y_tokens = parse_XY_from_tabular(buf, filename=file.filename, sheet_name=sheet)
 
     if X_list is None:
@@ -169,10 +188,9 @@ async def train_from_file(
 
     # --- LOG: нормалізовані X/Y окремо
     try:
-        import pandas as pd
-        pd.DataFrame([X_list]).to_csv(f"backend/data/datasets/{ts}__X.csv", index=False)
+        pd.DataFrame([X_list]).to_csv(DATASETS_DIR / f"{ts}__X.csv", index=False)
         if Y_tokens is not None:
-            pd.DataFrame([Y_tokens]).to_csv(f"backend/data/datasets/{ts}__Y_0_440.csv", index=False)
+            pd.DataFrame([Y_tokens]).to_csv(DATASETS_DIR / f"{ts}__Y_0_440.csv", index=False)
     except Exception:
         pass
 
@@ -204,12 +222,11 @@ async def train_from_file(
         "last_loss": loss_hist[-1],
         "avg_loss": sum(loss_hist) / len(loss_hist),
         "log_files": {
-            "original": orig_path,
-            "X_csv": f"backend/data/datasets/{ts}__X.csv",
-            "Y_csv": (f"backend/data/datasets/{ts}__Y_0_440.csv" if Y_tokens is not None else None),
+            "original": str(orig_path),
+            "X_csv": str(DATASETS_DIR / f"{ts}__X.csv"),
+            "Y_csv": (str(DATASETS_DIR / f"{ts}__Y_0_440.csv") if Y_tokens is not None else None),
         },
     }
-
 
 
 @app.post("/api/model/reset")
